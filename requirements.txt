@@ -1,2 +1,4 @@
-scikit-learn
+boto3
 numpy
+pymongo
+scikit-learn

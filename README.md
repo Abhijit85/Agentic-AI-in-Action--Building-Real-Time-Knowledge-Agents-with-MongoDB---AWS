@@ -1,66 +1,73 @@
 # Agentic AI Demo
 
-This repository contains a simple demonstration of an agentic AI knowledge assistant
-built without external APIs.  It illustrates how retrieval‑augmented generation
-(RAG) pipelines can be assembled using off‑the‑shelf Python packages.
+This repository now demonstrates a retrieval‑augmented workflow that streams
+knowledge from Amazon S3, persists chunked embeddings into MongoDB Atlas, and
+retrieves answers via Atlas Search hybrid (vector + keyword) queries.
 
-## Contents
+## Components
 
-- `demo.py` – the main script that loads a small knowledge base of text files,
-  builds a TF‑IDF index, accepts natural language questions, retrieves the most
-  relevant documents and produces a basic summary.
-- `data/` – a directory containing sample documents about topics such as
-  Matryoshka embeddings, Voyage AI models, Amazon Bedrock AgentCore and
-  retrieval‑augmented generation.  The script reads all `.txt` files in this
-  directory as its knowledge base.
+- `demo.py` – orchestrates ingestion from S3, embedding, Atlas persistence, and
+  the interactive question loop.
+- `services/` – integration helpers for S3 streaming, text chunking, hashing
+  embeddings, and the MongoDB Atlas persistence layer.
 
 ## Requirements
 
-This demo relies on the following Python packages, which are included in the
-exercise environment:
-
-- Python 3.7 or later
-- `scikit‑learn`
+- Python 3.8 or later
+- `boto3`
+- `pymongo`
+- `scikit-learn`
 - `numpy`
 
-No network access or large language model is required.  The script uses
-TF‑IDF vectors for semantic search and a simple word‑frequency algorithm for
-summarization.
+Install dependencies with:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Configuration
+
+Provide the following environment variables before running the demo:
+
+- `S3_BUCKET_NAME` (required): name of the source bucket.
+- `S3_PREFIX` (optional): restrict ingestion to keys under this prefix.
+- `MONGODB_ATLAS_URI` (required): connection string with write access.
+- `ATLAS_DB_NAME` (default: `demo`)
+- `ATLAS_COLLECTION_NAME` (default: `documents`)
+- `ATLAS_SEARCH_INDEX_NAME` (default: `demo_rag_index`)
+- `CHUNK_WORDS` (default: `400`): chunk size in words.
+- `CHUNK_OVERLAP` (default: `40`): overlap between consecutive chunks.
+- `TOP_K` (default: `3`): number of results returned per query.
+
+AWS credentials are resolved via the usual boto3 lookup chain (environment
+variables, AWS config files, or assumed roles).
 
 ## Running the Demo
 
-1. Ensure that `demo.py` and the `data/` directory are in the same folder.
-2. Open a terminal and run:
+1. Export the required environment variables.
+2. Ensure the target MongoDB Atlas database allows the IP you are running from
+   and that the Atlas Search feature is available for the cluster tier.
+3. Execute the script:
 
    ```bash
    python demo.py
    ```
 
-3. When prompted, type a question related to the knowledge base, e.g.:
+   The script will ingest objects from S3, chunk and embed them, upsert the
+   chunks into MongoDB Atlas, and then start an interactive prompt. Each query
+   issues an Atlas Search compound `text` + `knnBeta` query and displays
+   separate keyword and vector scores.
 
-   ```
-   What is Matryoshka representation learning?
-   What is AgentCore and what does it provide?
-   How do embedding models and rerankers reduce hallucinations?
-   ```
+4. Type `exit` (or press `Ctrl+C`) to quit.
 
-   The script will display the top documents it retrieved and then
-   output a brief answer assembled from the relevant documents.
+## Notes
 
-4. Type `exit` or press `Ctrl+C` to quit.
-
-## Extending the Demo
-
-This demo is intentionally simple.  To adapt it for a real workshop:
-
-- Replace the sample documents in `data/` with your own knowledge base or
-  ingest data from other sources (e.g. PDFs, web pages).  You can split large
-  documents into paragraphs or chunks and store each as a separate text file.
-- Use a more sophisticated vectorizer (such as sentence‑transformers) and
-  summarization model if you have access to larger models and network resources.
-- Integrate with a database like MongoDB to persist the knowledge base and
-  connect the retrieval pipeline to a vector search index.
-- Incorporate a generative language model (e.g. via Amazon Bedrock) to
-  formulate answers using the retrieved context.
-
-Feel free to modify and extend this script to suit your workshop needs.
+- The embeddings are produced with a `HashingVectorizer`, enabling deterministic
+  vectors without a separate model download. Swap in a higher quality embedding
+  model if desired; ensure the Atlas Search index definition matches the new
+  vector dimensionality.
+- The Atlas index definition is created on startup if it does not already
+  exist. Re-running the script will upsert chunks by a deterministic chunk ID
+  (`<s3-key>:::<chunk-index>`).
+- When adapting this demo, consider wiring in a downstream LLM or answering
+  module that consumes the retrieved context for richer responses.
