@@ -10,15 +10,15 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from services.atlas_store import AtlasStore, ChunkRecord
 from services.embedder import HashingEmbedder
 from services.s3_loader import S3DocumentLoader
 from services.text_processing import chunk_text, normalize_whitespace
+from services.llm_client import BedrockConfig, BedrockLLMClient, LLMInvocationError
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +33,15 @@ class AppConfig:
     mongodb_db: str
     mongodb_collection: str
     search_index: str
+    aws_region: str
+    aws_profile: Optional[str]
+    llm_model_id: str
     chunk_size: int = 400
     chunk_overlap: int = 40
     top_k: int = 3
+    llm_max_tokens: int = 512
+    llm_temperature: float = 0.2
+    llm_streaming: bool = False
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -46,17 +52,33 @@ class AppConfig:
         mongodb_uri = os.getenv("MONGODB_ATLAS_URI")
         if not mongodb_uri:
             missing.append("MONGODB_ATLAS_URI")
-        if missing:
-            raise ValueError(
-                "Missing required environment variables: " + ", ".join(missing)
-            )
 
         mongodb_db = os.getenv("ATLAS_DB_NAME", "demo")
         mongodb_collection = os.getenv("ATLAS_COLLECTION_NAME", "documents")
         search_index = os.getenv("ATLAS_SEARCH_INDEX_NAME", "demo_rag_index")
+        aws_region = os.getenv("AWS_REGION")
+        if not aws_region:
+            missing.append("AWS_REGION")
+        aws_profile = os.getenv("AWS_PROFILE")
+        llm_model_id = os.getenv(
+            "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
+        )
         chunk_size = int(os.getenv("CHUNK_WORDS", "400"))
         chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "40"))
         top_k = int(os.getenv("TOP_K", "3"))
+        llm_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "512"))
+        llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+        llm_streaming = os.getenv("LLM_STREAMING", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        if missing:
+            raise ValueError(
+                "Missing required environment variables: " + ", ".join(missing)
+            )
 
         return cls(
             s3_bucket=bucket,
@@ -65,9 +87,15 @@ class AppConfig:
             mongodb_db=mongodb_db,
             mongodb_collection=mongodb_collection,
             search_index=search_index,
+            aws_region=aws_region,
+            aws_profile=aws_profile,
+            llm_model_id=llm_model_id,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             top_k=top_k,
+            llm_max_tokens=llm_max_tokens,
+            llm_temperature=llm_temperature,
+            llm_streaming=llm_streaming,
         )
 
 
@@ -108,67 +136,63 @@ def ingest_documents(
     logger.info("Ingestion complete. Total chunks processed: %s", ingested_chunks)
 
 
-def simple_summarize(texts: List[str], num_sentences: int = 3) -> str:
-    """Summarize a list of documents using a simple word frequency heuristic."""
-    stop_words = set(
-        [
-            "the",
-            "is",
-            "and",
-            "to",
-            "of",
-            "a",
-            "in",
-            "for",
-            "on",
-            "with",
-            "that",
-            "this",
-            "as",
-            "an",
-            "by",
-            "it",
-            "be",
-            "are",
-            "from",
-            "or",
-            "at",
-            "into",
-            "their",
-            "which",
-            "these",
-            "such",
-        ]
+def assemble_prompt(question: str, documents: List[dict]) -> str:
+    """Compose a grounded prompt that includes numbered context passages."""
+    context_sections = []
+    for idx, doc in enumerate(documents, start=1):
+        metadata = doc.get("metadata", {})
+        source = metadata.get("source") or metadata.get("s3_key") or doc.get("chunk_id")
+        snippet = normalize_whitespace(doc.get("text", ""))
+        context_sections.append(f"[{idx}] Source: {source}\n{snippet}")
+
+    context_block = "\n\n".join(context_sections)
+    instructions = (
+        "You are an expert assistant answering questions using only the supplied context. "
+        "If the answer cannot be derived from the context, reply that you do not know. "
+        "Cite sources inline using the bracketed numbers, e.g., [1]."
     )
 
-    sentences = []
-    for text in texts:
-        text = text.replace("\n", " ").strip()
-        parts = re.split(r"(?<=[\.\?!])\s+", text)
-        for sentence in parts:
-            sentence = sentence.strip()
-            if len(sentence.split()) > 4:
-                sentences.append(sentence)
+    return (
+        f"{instructions}\n\n"
+        f"Question: {question}\n\n"
+        f"Context:\n{context_block}\n\n"
+        "Answer:"
+    )
 
-    if not sentences:
-        return "".join(texts)
 
-    word_freq = {}
-    for sentence in sentences:
-        words = re.findall(r"\b\w+\b", sentence.lower())
-        for word in words:
-            if word not in stop_words:
-                word_freq[word] = word_freq.get(word, 0) + 1
+def generate_grounded_answer(
+    question: str,
+    documents: List[dict],
+    *,
+    llm_client: BedrockLLMClient,
+    max_tokens: int,
+    temperature: float,
+    stream: bool = False,
+    on_token: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Invoke the LLM with the grounded prompt and return the response text."""
+    prompt = assemble_prompt(question, documents)
 
-    sentence_scores = []
-    for sentence in sentences:
-        words = re.findall(r"\b\w+\b", sentence.lower())
-        score = sum(word_freq.get(word, 0) for word in words)
-        sentence_scores.append((sentence, score))
+    if stream:
+        chunks: List[str] = []
+        try:
+            for piece in llm_client.stream(
+                prompt=prompt, max_tokens=max_tokens, temperature=temperature
+            ):
+                if on_token:
+                    on_token(piece)
+                chunks.append(piece)
+        except LLMInvocationError:
+            raise
+        return "".join(chunks).strip()
 
-    top_sentences = sorted(sentence_scores, key=lambda x: x[1], reverse=True)[:num_sentences]
-    top_sentences_text = [ts[0] for ts in sorted(top_sentences, key=lambda x: sentences.index(x[0]))]
-    return " ".join(top_sentences_text)
+    try:
+        response = llm_client.generate(
+            prompt=prompt, max_tokens=max_tokens, temperature=temperature
+        )
+    except LLMInvocationError:
+        raise
+    return response.strip()
 
 
 def main() -> None:
@@ -186,6 +210,15 @@ def main() -> None:
         database=config.mongodb_db,
         collection=config.mongodb_collection,
         index_name=config.search_index,
+    )
+    llm_client = BedrockLLMClient(
+        BedrockConfig(
+            region=config.aws_region,
+            model_id=config.llm_model_id,
+            profile=config.aws_profile,
+            max_tokens=config.llm_max_tokens,
+            temperature=config.llm_temperature,
+        )
     )
 
     try:
@@ -212,8 +245,44 @@ def main() -> None:
                 print("No documents matched your query.")
                 continue
 
-            print("\nTop documents:")
-            for doc in results:
+            print("\nAnswer:")
+            try:
+                if config.llm_streaming:
+                    printed = False
+
+                    def _echo(text: str) -> None:
+                        nonlocal printed
+                        printed = True
+                        print(text, end="", flush=True)
+
+                    answer = generate_grounded_answer(
+                        query,
+                        results,
+                        llm_client=llm_client,
+                        max_tokens=config.llm_max_tokens,
+                        temperature=config.llm_temperature,
+                        stream=True,
+                        on_token=_echo,
+                    )
+                    if printed:
+                        print()
+                    if not answer:
+                        print("(no response)")
+                else:
+                    answer = generate_grounded_answer(
+                        query,
+                        results,
+                        llm_client=llm_client,
+                        max_tokens=config.llm_max_tokens,
+                        temperature=config.llm_temperature,
+                    )
+                    print(answer or "(no response)")
+            except LLMInvocationError as exc:
+                logger.error("LLM generation failed: %s", exc)
+                continue
+
+            print("\nCited context:")
+            for idx, doc in enumerate(results, start=1):
                 vector_score = doc.get("vector_score")
                 keyword_score = doc.get("keyword_score")
                 scores = [f"search={doc.get('search_score', 0):.3f}"]
@@ -222,11 +291,13 @@ def main() -> None:
                 if keyword_score is not None:
                     scores.append(f"keyword={keyword_score:.3f}")
                 score_str = ", ".join(scores)
-                print(f"- {doc['metadata'].get('source', doc['chunk_id'])} ({score_str})")
-
-            summary = simple_summarize([doc["text"] for doc in results], num_sentences=3)
-            print("\nAnswer:")
-            print(summary)
+                metadata = doc.get("metadata", {})
+                source = metadata.get("source") or metadata.get("s3_key") or doc.get("chunk_id")
+                snippet = normalize_whitespace(doc.get("text", ""))
+                if len(snippet) > 240:
+                    snippet = snippet[:237] + "..."
+                print(f"[{idx}] {source} ({score_str})")
+                print(f"    {snippet}")
     except KeyboardInterrupt:
         pass
 
