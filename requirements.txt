@@ -3,3 +3,4 @@ numpy
 pymongo
 scikit-learn
 python-dotenv
+pytest
