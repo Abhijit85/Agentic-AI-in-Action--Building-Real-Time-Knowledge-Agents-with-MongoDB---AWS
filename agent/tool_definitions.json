@@ -1,0 +1,79 @@
+{
+  "tools": [
+    {
+      "name": "s3_ingest",
+      "description": "Stream documents from S3 and persist chunked embeddings into MongoDB Atlas.",
+      "entrypoint": "agent.agentcore_config.s3_ingest_tool",
+      "transport": "gateway",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "document_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+          "chunk_size": {"type": "integer", "minimum": 50},
+          "chunk_overlap": {"type": "integer", "minimum": 0},
+          "dry_run": {"type": "boolean"}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "documents_processed": {"type": "integer"},
+          "chunks_written": {"type": "integer"},
+          "dry_run": {"type": "boolean"},
+          "keys": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    {
+      "name": "mongo_search",
+      "description": "Query MongoDB Atlas Search with hybrid vector and keyword scoring.",
+      "entrypoint": "agent.agentcore_config.mongo_search_tool",
+      "transport": "gateway",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string"},
+          "top_k": {"type": "integer", "minimum": 1, "maximum": 20}
+        },
+        "required": ["query"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "matches": {"type": "array", "items": {"type": "object"}},
+          "count": {"type": "integer"}
+        }
+      }
+    },
+    {
+      "name": "bedrock_answer",
+      "description": "Call an Amazon Bedrock model with retrieved context to produce an answer.",
+      "entrypoint": "agent.agentcore_config.bedrock_answer_tool",
+      "transport": "gateway",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "question": {"type": "string"},
+          "context": {"type": "array", "items": {"type": "object"}},
+          "instructions": {"type": "string"},
+          "max_tokens": {"type": "integer", "minimum": 1},
+          "temperature": {"type": "number", "minimum": 0.0},
+          "top_k": {"type": "integer", "minimum": 1},
+          "include_prompt": {"type": "boolean"},
+          "stream": {"type": "boolean"},
+          "return_tokens": {"type": "boolean"}
+        },
+        "required": ["question", "context"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {"type": "string"},
+          "model_id": {"type": "string"},
+          "context_size": {"type": "integer"},
+          "sources": {"type": "array", "items": {"type": "object"}}
+        }
+      }
+    }
+  ]
+}

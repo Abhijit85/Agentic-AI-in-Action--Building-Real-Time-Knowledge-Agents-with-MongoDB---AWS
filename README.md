@@ -10,6 +10,12 @@ retrieves answers via Atlas Search hybrid (vector + keyword) queries.
   the interactive question loop.
 - `services/` – integration helpers for S3 streaming, text chunking, hashing
   embeddings, the MongoDB Atlas persistence layer, and Bedrock-backed LLM calls.
+- `services/prompting.py` – shared prompt and context-normalisation helpers for
+  both the CLI demo and AgentCore tooling.
+- `agent/agentcore_config.py` – declarative AgentCore runtime, memory, identity
+  and tool configuration for the retrieval-augmented pipeline.
+- `agent/tool_definitions.json` – Model Context Protocol (MCP) tool definitions
+  for the S3 ingest, MongoDB Atlas search, and Bedrock answer tools.
 
 ## Requirements
 
@@ -67,6 +73,44 @@ above and will exit if they are missing.
    answer alongside source citations and retrieval scores.
 
 4. Type `exit` (or press `Ctrl+C`) to quit.
+
+## Deploying with Bedrock AgentCore
+
+This repository now includes everything required to host the retrieval pipeline
+as a Bedrock AgentCore agent. The `agent/agentcore_config.py` module exposes a
+single `build_agentcore_configuration` function that produces a complete
+runtime/memory/identity/tool configuration compatible with AgentCore's SDK. The
+same module also implements the three gateway tools referenced in the proposal:
+
+- `s3_ingest_tool` uploads fresh content from Amazon S3, chunks and embeds the
+  text, and upserts the vectors into MongoDB Atlas.
+- `mongo_search_tool` performs a hybrid Atlas Search query using the shared
+  hashing embedder to keep scoring consistent across the CLI and AgentCore.
+- `bedrock_answer_tool` accepts retrieved context, builds a grounded prompt via
+  `services.prompting.build_grounded_answer_prompt`, and calls the configured
+  Amazon Bedrock model. Optional flags enable streaming and prompt inspection so
+  the gateway can support interactive channels.
+
+To register the tools with AgentCore Gateway, publish `agent/tool_definitions.json`.
+The JSON mirrors the schemas used inside `build_tool_specs`, so the CLI demo and
+the gateway stay in sync. When AgentCore is available at runtime the helper
+`initialise_agent_runtime` dynamically registers the tool functions with the
+runtime and wires in observability and security policies.
+
+### Identity & Security
+
+AgentCore Identity support is built in. Provide the following optional
+environment variables to enable Cognito enforcement via AgentCore's managed
+identity service:
+
+- `AGENT_COGNITO_USER_POOL_ID`
+- `AGENT_COGNITO_APP_CLIENT_ID`
+- `AGENT_ALLOWED_GROUPS` (comma-separated)
+- `AGENT_IDENTITY_PROVIDER` (override when using a non-Cognito identity stack)
+
+When these are present `build_agentcore_configuration` injects an `identity`
+block so AgentCore can validate tokens and group membership. The security policy
+has also been updated to whitelist the new `bedrock_answer` gateway tool.
 
 ## Notes
 

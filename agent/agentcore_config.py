@@ -11,15 +11,17 @@ import importlib
 import logging
 import os
 import boto3
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from services.atlas_store import AtlasStore, ChunkRecord
 from services.embedder import HashingEmbedder
 from services.llm_client import BedrockConfig, BedrockLLMClient
 from services.s3_loader import S3DocumentLoader
 from services.text_processing import chunk_text, normalize_whitespace
+from services.prompting import build_grounded_answer_prompt, prepare_context_documents
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,11 @@ class AgentCoreSettings:
         ]
     )
 
+    cognito_user_pool_id: Optional[str] = None
+    cognito_app_client_id: Optional[str] = None
+    identity_provider: str = "agentcore.identity.CognitoIdentityProvider"
+    identity_allowed_groups: List[str] = field(default_factory=list)
+
     @classmethod
     def from_env(cls) -> "AgentCoreSettings":
         """Build settings from environment variables shared with the demo."""
@@ -131,6 +138,17 @@ class AgentCoreSettings:
             memory_long_term_top_k=int(os.getenv("AGENT_MEMORY_TOPK", "5")),
             ingestion_chunk_words=int(os.getenv("CHUNK_WORDS", "400")),
             ingestion_chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "40")),
+            cognito_user_pool_id=os.getenv("AGENT_COGNITO_USER_POOL_ID"),
+            cognito_app_client_id=os.getenv("AGENT_COGNITO_APP_CLIENT_ID"),
+            identity_provider=os.getenv(
+                "AGENT_IDENTITY_PROVIDER",
+                "agentcore.identity.CognitoIdentityProvider",
+            ),
+            identity_allowed_groups=[
+                group.strip()
+                for group in os.getenv("AGENT_ALLOWED_GROUPS", "").split(",")
+                if group.strip()
+            ],
         )
 
 
@@ -172,6 +190,20 @@ class AgentResources:
             bucket_name=self.settings.s3_bucket,
             prefix=self.settings.s3_prefix,
             s3_client=self.aws_session.client("s3"),
+        )
+
+    @cached_property
+    def bedrock_client(self) -> BedrockLLMClient:
+        return BedrockLLMClient(
+            BedrockConfig(
+                region=self.settings.aws_region,
+                model_id=self.settings.bedrock_model_id,
+                access_key_id=self.settings.aws_access_key_id,
+                secret_access_key=self.settings.aws_secret_access_key,
+                session_token=self.settings.aws_session_token,
+                max_tokens=self.settings.bedrock_max_tokens,
+                temperature=self.settings.bedrock_temperature,
+            )
         )
 
     def ensure_vector_index(self) -> None:
@@ -326,7 +358,7 @@ def _format_long_term(documents: Iterable[Mapping[str, Any]]) -> str:
 # ----------------------------------------------------------------------------
 
 
-def mongo_atlas_query_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def mongo_search_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """Run a hybrid Atlas Search query using the conversation embedder."""
     resources = _require_resources()
     question = str(
@@ -352,6 +384,115 @@ def mongo_atlas_query_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
     for doc in documents:
         doc["text"] = normalize_whitespace(doc.get("text", ""))
     return {"matches": documents, "count": len(documents)}
+
+
+def bedrock_answer_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Generate a grounded answer from retrieved context using Bedrock."""
+    resources = _require_resources()
+
+    question = str(
+        payload.get("question")
+        or payload.get("query")
+        or payload.get("prompt")
+        or ""
+    ).strip()
+    if not question:
+        raise ValueError("Bedrock answer tool requires a non-empty 'question'.")
+
+    raw_context = payload.get("context") or payload.get("documents") or []
+    if isinstance(raw_context, (str, bytes)):
+        raw_iterable: Iterable[Any] = [raw_context]
+    elif not isinstance(raw_context, Iterable):
+        raise ValueError("'context' must be an iterable of documents.")
+    else:
+        raw_iterable = raw_context
+
+    documents = prepare_context_documents(raw_iterable)
+    if not documents:
+        raise ValueError("At least one context document is required to call Bedrock.")
+
+    top_k = payload.get("top_k")
+    if top_k is not None:
+        try:
+            limit = max(int(top_k), 1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("'top_k' must be an integer if provided.") from exc
+        documents = documents[:limit]
+
+    instructions = str(payload.get("instructions") or "").strip() or None
+    max_tokens = int(payload.get("max_tokens") or resources.settings.bedrock_max_tokens)
+    temperature = float(
+        payload.get("temperature") or resources.settings.bedrock_temperature
+    )
+    include_prompt = bool(payload.get("include_prompt", False))
+    stream = bool(payload.get("stream") or payload.get("streaming"))
+    return_tokens = bool(payload.get("return_tokens", False))
+
+    prompt = build_grounded_answer_prompt(question, documents, instructions=instructions)
+
+    logger.debug(
+        "Calling Bedrock answer tool (tokens=%s, temperature=%s, stream=%s)",
+        max_tokens,
+        temperature,
+        stream,
+    )
+
+    tokens: List[str] = []
+    if stream:
+        for piece in resources.bedrock_client.stream(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ):
+            tokens.append(piece)
+        answer = "".join(tokens).strip()
+    else:
+        answer = resources.bedrock_client.generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ).strip()
+
+    sources: List[Dict[str, Any]] = []
+    for doc in documents:
+        metadata = doc.get("metadata", {}) if isinstance(doc, Mapping) else {}
+        if isinstance(metadata, Mapping):
+            source = (
+                metadata.get("source")
+                or metadata.get("s3_key")
+                or metadata.get("uri")
+                or metadata.get("document_id")
+            )
+        else:
+            source = None
+        sources.append(
+            {
+                "source": source,
+                "chunk_id": doc.get("chunk_id"),
+                "vector_score": doc.get("vector_score"),
+                "keyword_score": doc.get("keyword_score"),
+                "search_score": doc.get("search_score"),
+            }
+        )
+
+    result: Dict[str, Any] = {
+        "answer": answer,
+        "question": question,
+        "model_id": resources.settings.bedrock_model_id,
+        "context_size": len(documents),
+        "sources": sources,
+    }
+
+    if include_prompt:
+        result["prompt"] = prompt
+    if stream and return_tokens:
+        result["tokens"] = tokens
+
+    return result
+
+
+# Backwards compatibility alias for earlier revisions
+mongo_atlas_query_tool = mongo_search_tool
 
 
 def s3_ingest_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
@@ -431,9 +572,9 @@ def build_tool_specs(resources: AgentResources) -> List[Dict[str, Any]]:
     _ = resources  # Acoustic guard; specs are static but keep signature aligned
     return [
         {
-            "name": "mongo_atlas_query",
+            "name": "mongo_search",
             "description": "Query MongoDB Atlas Search with hybrid vector + keyword scoring.",
-            "entrypoint": "agent.agentcore_config.mongo_atlas_query_tool",
+            "entrypoint": "agent.agentcore_config.mongo_search_tool",
             "transport": "gateway",
             "input_schema": {
                 "type": "object",
@@ -477,6 +618,40 @@ def build_tool_specs(resources: AgentResources) -> List[Dict[str, Any]]:
             },
             "secure": True,
         },
+        {
+            "name": "bedrock_answer",
+            "description": "Call an Amazon Bedrock model with retrieved context to produce an answer.",
+            "entrypoint": "agent.agentcore_config.bedrock_answer_tool",
+            "transport": "gateway",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "context": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                    "instructions": {"type": "string"},
+                    "max_tokens": {"type": "integer", "minimum": 1},
+                    "temperature": {"type": "number", "minimum": 0.0},
+                    "top_k": {"type": "integer", "minimum": 1},
+                    "include_prompt": {"type": "boolean"},
+                    "stream": {"type": "boolean"},
+                    "return_tokens": {"type": "boolean"},
+                },
+                "required": ["question", "context"],
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string"},
+                    "model_id": {"type": "string"},
+                    "context_size": {"type": "integer"},
+                    "sources": {"type": "array", "items": {"type": "object"}},
+                },
+            },
+            "secure": True,
+        },
     ]
 
 
@@ -492,13 +667,15 @@ def register_tools_with_runtime(runtime: Any, resources: AgentResources) -> None
         logger.info("Tool registry does not expose register/add; skipping dynamic wiring.")
         return
 
+    handlers = {
+        "mongo_search": mongo_search_tool,
+        "s3_ingest": s3_ingest_tool,
+        "bedrock_answer": bedrock_answer_tool,
+    }
+
     for spec in build_tool_specs(resources):
-        handler: Callable[..., Any]
-        if spec["name"] == "mongo_atlas_query":
-            handler = mongo_atlas_query_tool
-        elif spec["name"] == "s3_ingest":
-            handler = s3_ingest_tool
-        else:
+        handler = handlers.get(spec["name"])
+        if handler is None:
             continue
 
         try:
@@ -561,7 +738,7 @@ def configure_security(runtime: Any, settings: AgentCoreSettings) -> None:
     policy = _optional_factory(
         "agentcore.security",
         "DefaultSecurityPolicy",
-        allowed_tools=["mongo_atlas_query", "s3_ingest"],
+        allowed_tools=["mongo_search", "s3_ingest", "bedrock_answer"],
         network_allowlist=settings.security_network_allowlist,
         environment_blocklist=settings.security_environment_blocklist,
     )
@@ -635,7 +812,7 @@ def build_agentcore_configuration(
         "security": {
             "policy": "agentcore.security.DefaultSecurityPolicy",
             "config": {
-                "allowed_tools": ["mongo_atlas_query", "s3_ingest"],
+                "allowed_tools": ["mongo_search", "s3_ingest", "bedrock_answer"],
                 "network_allowlist": settings.security_network_allowlist,
                 "environment_blocklist": settings.security_environment_blocklist,
             },
@@ -659,6 +836,16 @@ def build_agentcore_configuration(
         },
         "deployment": select_deployment_adapter(settings.deployment_channel),
     }
+
+    if settings.cognito_user_pool_id and settings.cognito_app_client_id:
+        configuration["identity"] = {
+            "provider": settings.identity_provider,
+            "config": {
+                "user_pool_id": settings.cognito_user_pool_id,
+                "app_client_id": settings.cognito_app_client_id,
+                "allowed_groups": settings.identity_allowed_groups,
+            },
+        }
 
     return configuration
 
@@ -793,8 +980,10 @@ __all__ = [
     "register_tools_with_runtime",
     "configure_observability",
     "configure_security",
+    "mongo_search_tool",
     "mongo_atlas_query_tool",
     "s3_ingest_tool",
+    "bedrock_answer_tool",
     "select_deployment_adapter",
     "set_runtime_resources",
 ]
