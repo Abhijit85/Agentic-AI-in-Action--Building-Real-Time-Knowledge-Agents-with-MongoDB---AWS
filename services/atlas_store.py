@@ -49,26 +49,28 @@ class AtlasStore:
             "indexes": [
                 {
                     "name": self._index_name,
+                    "type": "vectorSearch",
                     "definition": {
-                        "mappings": {
-                            "dynamic": False,
-                            "fields": {
-                                "text": {"type": "string"},
-                                "embedding": {
-                                    "type": "vector",
-                                    "similarity": "cosine",
-                                    "dimensions": vector_dimensions,
-                                },
-                                "metadata": {
-                                    "type": "document",
-                                    "fields": {
-                                        "source": {"type": "string"},
-                                        "s3_key": {"type": "string"},
-                                        "chunk_index": {"type": "number"},
-                                    },
-                                },
+                        "fields": [
+                            {
+                                "type": "vector",
+                                "path": "embedding",
+                                "numDimensions": vector_dimensions,
+                                "similarity": "cosine",
                             },
-                        }
+                            {
+                                "type": "filter",
+                                "path": "metadata.source",
+                            },
+                            {
+                                "type": "filter",
+                                "path": "metadata.s3_key",
+                            },
+                            {
+                                "type": "filter",
+                                "path": "metadata.chunk_index",
+                            },
+                        ]
                     },
                 }
             ],
@@ -118,70 +120,32 @@ class AtlasStore:
         if not query_vector:
             raise ValueError("query_vector cannot be empty")
 
-        compound: Dict[str, object] = {
-            "should": [
-                {
-                    "knnBeta": {
-                        "vector": query_vector,
-                        "path": "embedding",
-                        "k": max(top_k, 1),
-                    }
-                }
-            ]
-        }
-        if query_text:
-            compound["must"] = [
-                {
-                    "text": {
-                        "query": query_text,
-                        "path": ["text"],
-                        "score": {"boost": {"value": 1.0}},
-                    }
-                }
-            ]
-
+        num_candidates = max(top_k * 8, top_k, 1)
         pipeline = [
             {
-                "$search": {
+                "$vectorSearch": {
                     "index": self._index_name,
-                    "compound": compound,
-                    "scoreDetails": True,
+                    "path": "embedding",
+                    "queryVector": query_vector,
+                    "numCandidates": num_candidates,
+                    "limit": max(top_k, 1),
                 }
             },
-            {"$limit": max(top_k, 1)},
             {
                 "$project": {
                     "_id": 0,
                     "chunk_id": 1,
                     "text": 1,
                     "metadata": 1,
-                    "search_score": {"$meta": "searchScore"},
-                    "score_details": {"$meta": "searchScoreDetails"},
+                    "vector_score": {"$meta": "vectorSearchScore"},
                 }
             },
         ]
 
         results = list(self._collection.aggregate(pipeline))
         for doc in results:
-            score_details = doc.pop("score_details", None)
-            doc["vector_score"] = _extract_operator_score(score_details, target="knnBeta")
-            doc["keyword_score"] = _extract_operator_score(score_details, target="text")
-            doc["search_score"] = float(doc.get("search_score", 0.0))
+            score = doc.get("vector_score")
+            doc["vector_score"] = float(score) if score is not None else None
+            doc["keyword_score"] = None
+            doc["search_score"] = doc["vector_score"] or 0.0
         return results
-
-
-def _extract_operator_score(details: Optional[Dict[str, object]], *, target: str) -> Optional[float]:
-    """Traverse Atlas score details to find a specific operator contribution."""
-    if not isinstance(details, dict):
-        return None
-
-    operator = details.get("operator")
-    if operator == target:
-        score = details.get("score")
-        return float(score) if score is not None else None
-
-    for child in details.get("details", []) or []:
-        extracted = _extract_operator_score(child, target=target)
-        if extracted is not None:
-            return extracted
-    return None

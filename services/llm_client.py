@@ -19,7 +19,9 @@ class BedrockConfig:
 
     region: str
     model_id: str
-    profile: Optional[str] = None
+    access_key_id: Optional[str] = None
+    secret_access_key: Optional[str] = None
+    session_token: Optional[str] = None
     max_tokens: int = 512
     temperature: float = 0.2
 
@@ -30,8 +32,13 @@ class BedrockLLMClient:
     def __init__(self, config: BedrockConfig):
         self._config = config
         session_kwargs = {"region_name": config.region}
-        if config.profile:
-            session_kwargs["profile_name"] = config.profile
+        if config.access_key_id and config.secret_access_key:
+            session_kwargs.update(
+                aws_access_key_id=config.access_key_id,
+                aws_secret_access_key=config.secret_access_key,
+            )
+        if config.session_token:
+            session_kwargs["aws_session_token"] = config.session_token
         session = boto3.session.Session(**session_kwargs)
         self._client = session.client("bedrock-runtime")
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import boto3
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
@@ -44,7 +45,9 @@ class AgentCoreSettings:
     atlas_search_index: str
     s3_bucket: str
     s3_prefix: Optional[str] = None
-    aws_profile: Optional[str] = None
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_session_token: Optional[str] = None
 
     bedrock_model_id: str = "anthropic.claude-3-haiku-20240307-v1:0"
     bedrock_max_tokens: int = 1024
@@ -86,6 +89,8 @@ class AgentCoreSettings:
             "S3_BUCKET_NAME": os.getenv("S3_BUCKET_NAME"),
             "MONGODB_ATLAS_URI": os.getenv("MONGODB_ATLAS_URI"),
             "AWS_REGION": os.getenv("AWS_REGION"),
+            "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID"),
+            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY"),
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
@@ -93,6 +98,8 @@ class AgentCoreSettings:
                 "Missing required environment variables for AgentCore: "
                 + ", ".join(missing)
             )
+
+        aws_session_token = os.getenv("AWS_SESSION_TOKEN")
 
         return cls(
             aws_region=required["AWS_REGION"],
@@ -102,7 +109,9 @@ class AgentCoreSettings:
             atlas_search_index=os.getenv("ATLAS_SEARCH_INDEX_NAME", "demo_rag_index"),
             s3_bucket=required["S3_BUCKET_NAME"],
             s3_prefix=os.getenv("S3_PREFIX"),
-            aws_profile=os.getenv("AWS_PROFILE"),
+            aws_access_key_id=required["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=required["AWS_SECRET_ACCESS_KEY"],
+            aws_session_token=aws_session_token,
             bedrock_model_id=os.getenv(
                 "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
             ),
@@ -147,10 +156,22 @@ class AgentResources:
         )
 
     @cached_property
+    def aws_session(self) -> boto3.session.Session:
+        session_kwargs = {
+            "aws_access_key_id": self.settings.aws_access_key_id,
+            "aws_secret_access_key": self.settings.aws_secret_access_key,
+            "region_name": self.settings.aws_region,
+        }
+        if self.settings.aws_session_token:
+            session_kwargs["aws_session_token"] = self.settings.aws_session_token
+        return boto3.session.Session(**session_kwargs)
+
+    @cached_property
     def s3_loader(self) -> S3DocumentLoader:
         return S3DocumentLoader(
             bucket_name=self.settings.s3_bucket,
             prefix=self.settings.s3_prefix,
+            s3_client=self.aws_session.client("s3"),
         )
 
     def ensure_vector_index(self) -> None:
@@ -571,7 +592,9 @@ def build_agentcore_configuration(
 
     bedrock_config = {
         "aws_region": settings.aws_region,
-        "aws_profile": settings.aws_profile,
+        "aws_access_key_id": settings.aws_access_key_id,
+        "aws_secret_access_key": settings.aws_secret_access_key,
+        "aws_session_token": settings.aws_session_token,
         "model_id": settings.bedrock_model_id,
         "max_tokens": settings.bedrock_max_tokens,
         "temperature": settings.bedrock_temperature,
@@ -682,7 +705,9 @@ def build_reasoner(settings: AgentCoreSettings) -> MemoryAwareBedrockReasoner:
         BedrockConfig(
             region=settings.aws_region,
             model_id=settings.bedrock_model_id,
-            profile=settings.aws_profile,
+            access_key_id=settings.aws_access_key_id,
+            secret_access_key=settings.aws_secret_access_key,
+            session_token=settings.aws_session_token,
             max_tokens=settings.bedrock_max_tokens,
             temperature=settings.bedrock_temperature,
         )

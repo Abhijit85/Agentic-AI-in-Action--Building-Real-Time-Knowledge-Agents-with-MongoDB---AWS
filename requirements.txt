@@ -2,3 +2,4 @@ boto3
 numpy
 pymongo
 scikit-learn
+python-dotenv

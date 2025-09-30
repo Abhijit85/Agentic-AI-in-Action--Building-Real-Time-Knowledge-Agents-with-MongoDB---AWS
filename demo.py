@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+
+import boto3
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -20,7 +22,21 @@ from services.s3_loader import S3DocumentLoader
 from services.text_processing import chunk_text, normalize_whitespace
 from services.llm_client import BedrockConfig, BedrockLLMClient, LLMInvocationError
 
+
+def _env_value(name: str) -> Optional[str]:
+    """Treat unset or blank environment variables as missing."""
+    value = os.getenv(name)
+    if value is None:
+        return None
+    if value.strip() == "":
+        return None
+    return value
+from dotenv import load_dotenv
+
+load_dotenv()
+
 logger = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -34,7 +50,9 @@ class AppConfig:
     mongodb_collection: str
     search_index: str
     aws_region: str
-    aws_profile: Optional[str]
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: Optional[str]
     llm_model_id: str
     chunk_size: int = 400
     chunk_overlap: int = 40
@@ -46,29 +64,33 @@ class AppConfig:
     @classmethod
     def from_env(cls) -> "AppConfig":
         missing = []
-        bucket = os.getenv("S3_BUCKET_NAME")
+        bucket = _env_value("S3_BUCKET_NAME")
         if not bucket:
             missing.append("S3_BUCKET_NAME")
-        mongodb_uri = os.getenv("MONGODB_ATLAS_URI")
+        mongodb_uri = _env_value("MONGODB_ATLAS_URI")
         if not mongodb_uri:
             missing.append("MONGODB_ATLAS_URI")
 
-        mongodb_db = os.getenv("ATLAS_DB_NAME", "demo")
-        mongodb_collection = os.getenv("ATLAS_COLLECTION_NAME", "documents")
-        search_index = os.getenv("ATLAS_SEARCH_INDEX_NAME", "demo_rag_index")
-        aws_region = os.getenv("AWS_REGION")
+        mongodb_db = _env_value("ATLAS_DB_NAME") or "demo"
+        mongodb_collection = _env_value("ATLAS_COLLECTION_NAME") or "documents"
+        search_index = _env_value("ATLAS_SEARCH_INDEX_NAME") or "demo_rag_index"
+        aws_region = _env_value("AWS_REGION")
         if not aws_region:
             missing.append("AWS_REGION")
-        aws_profile = os.getenv("AWS_PROFILE")
-        llm_model_id = os.getenv(
-            "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
-        )
-        chunk_size = int(os.getenv("CHUNK_WORDS", "400"))
-        chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "40"))
-        top_k = int(os.getenv("TOP_K", "3"))
-        llm_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "512"))
-        llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
-        llm_streaming = os.getenv("LLM_STREAMING", "false").lower() in {
+        aws_access_key_id = _env_value("AWS_ACCESS_KEY_ID")
+        if not aws_access_key_id:
+            missing.append("AWS_ACCESS_KEY_ID")
+        aws_secret_access_key = _env_value("AWS_SECRET_ACCESS_KEY")
+        if not aws_secret_access_key:
+            missing.append("AWS_SECRET_ACCESS_KEY")
+        aws_session_token = _env_value("AWS_SESSION_TOKEN")
+        llm_model_id = _env_value("BEDROCK_MODEL_ID") or "anthropic.claude-3-haiku-20240307-v1:0"
+        chunk_size = int(_env_value("CHUNK_WORDS") or "400")
+        chunk_overlap = int(_env_value("CHUNK_OVERLAP") or "40")
+        top_k = int(_env_value("TOP_K") or "3")
+        llm_max_tokens = int(_env_value("LLM_MAX_TOKENS") or "512")
+        llm_temperature = float(_env_value("LLM_TEMPERATURE") or "0.2")
+        llm_streaming = (_env_value("LLM_STREAMING") or "false").lower() in {
             "1",
             "true",
             "yes",
@@ -88,7 +110,9 @@ class AppConfig:
             mongodb_collection=mongodb_collection,
             search_index=search_index,
             aws_region=aws_region,
-            aws_profile=aws_profile,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
             llm_model_id=llm_model_id,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -107,8 +131,6 @@ def ingest_documents(
     config: AppConfig,
 ) -> None:
     """Stream documents from S3, chunk, embed, and store them in Atlas."""
-    store.ensure_indexes(vector_dimensions=embedder.n_features)
-
     batch: List[ChunkRecord] = []
     ingested_chunks = 0
     batch_size = 25
@@ -132,6 +154,9 @@ def ingest_documents(
 
     if batch:
         store.upsert_chunks(batch)
+
+    # Ensure the Atlas Search index exists once documents are present.
+    store.ensure_indexes(vector_dimensions=embedder.n_features)
 
     logger.info("Ingestion complete. Total chunks processed: %s", ingested_chunks)
 
@@ -203,7 +228,24 @@ def main() -> None:
         logger.error("%s", exc)
         sys.exit(1)
 
-    loader = S3DocumentLoader(bucket_name=config.s3_bucket, prefix=config.s3_prefix)
+    # Boto treats an empty AWS_PROFILE as a request for a profile named ""
+    if os.environ.get("AWS_PROFILE", "").strip() == "":
+        os.environ.pop("AWS_PROFILE", None)
+
+    session_kwargs = {
+        "aws_access_key_id": config.aws_access_key_id,
+        "aws_secret_access_key": config.aws_secret_access_key,
+        "region_name": config.aws_region,
+    }
+    if config.aws_session_token:
+        session_kwargs["aws_session_token"] = config.aws_session_token
+    aws_session = boto3.session.Session(**session_kwargs)
+
+    loader = S3DocumentLoader(
+        bucket_name=config.s3_bucket,
+        prefix=config.s3_prefix,
+        s3_client=aws_session.client("s3"),
+    )
     embedder = HashingEmbedder()
     store = AtlasStore(
         connection_string=config.mongodb_uri,
@@ -215,7 +257,9 @@ def main() -> None:
         BedrockConfig(
             region=config.aws_region,
             model_id=config.llm_model_id,
-            profile=config.aws_profile,
+            access_key_id=config.aws_access_key_id,
+            secret_access_key=config.aws_secret_access_key,
+            session_token=config.aws_session_token,
             max_tokens=config.llm_max_tokens,
             temperature=config.llm_temperature,
         )
