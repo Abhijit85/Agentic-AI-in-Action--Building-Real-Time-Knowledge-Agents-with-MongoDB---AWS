@@ -16,6 +16,8 @@ import boto3
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
+from dotenv import load_dotenv
+
 from services.atlas_store import AtlasStore, ChunkRecord
 from services.embedder import HashingEmbedder
 from services.s3_loader import S3DocumentLoader
@@ -28,10 +30,8 @@ def _env_value(name: str) -> Optional[str]:
     value = os.getenv(name)
     if value is None:
         return None
-    if value.strip() == "":
-        return None
     return value
-from dotenv import load_dotenv
+
 
 load_dotenv()
 
