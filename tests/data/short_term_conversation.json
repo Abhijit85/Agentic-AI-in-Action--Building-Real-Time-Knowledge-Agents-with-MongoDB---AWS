@@ -1,0 +1,14 @@
+[
+  {"role": "user", "content": "Hello assistant"},
+  {"role": "assistant", "content": "Hi there!"},
+  {"role": "user", "content": "Can you remember things?"},
+  {"role": "assistant", "content": "I can remember our recent conversation."},
+  {"role": "user", "content": "Great"},
+  {"role": "assistant", "content": "How can I help you next?"},
+  {"role": "user", "content": "Tell me about project alpha"},
+  {"role": "assistant", "content": "Project Alpha is on track."},
+  {"role": "user", "content": "And project beta?"},
+  {"role": "assistant", "content": "Project Beta needs resources."},
+  {"role": "user", "content": "Schedule a meeting"},
+  {"role": "assistant", "content": "Sure, I'll schedule it."}
+]
