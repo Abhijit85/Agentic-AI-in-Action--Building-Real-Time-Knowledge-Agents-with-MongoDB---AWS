@@ -22,6 +22,7 @@ from services.atlas_store import AtlasStore, ChunkRecord
 from services.embedder import HashingEmbedder
 from services.s3_loader import S3DocumentLoader
 from services.text_processing import chunk_text, normalize_whitespace
+from services.prompting import build_grounded_answer_prompt
 from services.llm_client import BedrockConfig, BedrockLLMClient, LLMInvocationError
 
 
@@ -161,30 +162,6 @@ def ingest_documents(
     logger.info("Ingestion complete. Total chunks processed: %s", ingested_chunks)
 
 
-def assemble_prompt(question: str, documents: List[dict]) -> str:
-    """Compose a grounded prompt that includes numbered context passages."""
-    context_sections = []
-    for idx, doc in enumerate(documents, start=1):
-        metadata = doc.get("metadata", {})
-        source = metadata.get("source") or metadata.get("s3_key") or doc.get("chunk_id")
-        snippet = normalize_whitespace(doc.get("text", ""))
-        context_sections.append(f"[{idx}] Source: {source}\n{snippet}")
-
-    context_block = "\n\n".join(context_sections)
-    instructions = (
-        "You are an expert assistant answering questions using only the supplied context. "
-        "If the answer cannot be derived from the context, reply that you do not know. "
-        "Cite sources inline using the bracketed numbers, e.g., [1]."
-    )
-
-    return (
-        f"{instructions}\n\n"
-        f"Question: {question}\n\n"
-        f"Context:\n{context_block}\n\n"
-        "Answer:"
-    )
-
-
 def generate_grounded_answer(
     question: str,
     documents: List[dict],
@@ -196,7 +173,7 @@ def generate_grounded_answer(
     on_token: Optional[Callable[[str], None]] = None,
 ) -> str:
     """Invoke the LLM with the grounded prompt and return the response text."""
-    prompt = assemble_prompt(question, documents)
+    prompt = build_grounded_answer_prompt(question, documents)
 
     if stream:
         chunks: List[str] = []
