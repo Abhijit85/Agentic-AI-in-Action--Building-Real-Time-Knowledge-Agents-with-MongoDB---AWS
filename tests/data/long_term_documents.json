@@ -1,0 +1,10 @@
+[
+  {
+    "text": "Project Alpha is a strategic initiative to modernize the analytics pipeline across the organization.",
+    "metadata": {"source": "project_alpha.md"}
+  },
+  {
+    "text": "Project Beta focuses on customer retention. It requires coordination between marketing and support teams to deploy new playbooks.",
+    "metadata": {"source": "project_beta.md"}
+  }
+]
