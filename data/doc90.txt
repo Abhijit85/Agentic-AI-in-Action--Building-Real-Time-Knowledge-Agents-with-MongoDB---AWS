@@ -1,0 +1,11 @@
+Insights on MongoDB Atlas and Voyage AI: File 90. MongoDB teams are pairing Atlas Online Archive with Voyage-
+qa-expert embeddings to serve customer-success copilots. Engineers emphasize schema discipline so the Atlas
+Search index keeps pace with ingestion volume while still surfacing precise intents.
+
+Solution architects recommend adaptive ANN to mix lexical and neural relevance. By storing Voyage vectors in
+Atlas collections, they can re-rank matches over structured metadata, ensuring that domain-tuned passages stay
+visible during high-concurrency workloads.
+
+Implementation playbooks highlight serverless trigger pipelines alongside retrieval-augmented synthesis to
+stabilise agent responses. Teams document how PCI DSS segmentation requirements are met by using MongoDB Realm
+rules, scoped API keys, and encrypted S3 object storage for raw documents before chunking.

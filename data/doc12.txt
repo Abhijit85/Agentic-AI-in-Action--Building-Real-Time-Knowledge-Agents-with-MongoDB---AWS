@@ -1,0 +1,11 @@
+Insights on MongoDB Atlas and Voyage AI: File 12. MongoDB teams are pairing Atlas Charts integrations with
+Voyage-multi-modal embeddings to serve data lineage explorers. Engineers emphasize schema discipline so the
+Atlas Search index keeps pace with ingestion volume while still surfacing precise intents.
+
+Solution architects recommend Atlas vector search to mix lexical and neural relevance. By storing Voyage
+vectors in Atlas collections, they can re-rank matches over structured metadata, ensuring that domain-tuned
+passages stay visible during high-concurrency workloads.
+
+Implementation playbooks highlight role-based prompt enrichment alongside confidence-calibrated messaging to
+stabilise agent responses. Teams document how ISO 27001 controls requirements are met by using MongoDB Realm
+rules, scoped API keys, and encrypted S3 object storage for raw documents before chunking.

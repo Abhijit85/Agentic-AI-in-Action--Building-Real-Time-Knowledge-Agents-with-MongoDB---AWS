@@ -1,0 +1,11 @@
+Insights on MongoDB Atlas and Voyage AI: File 47. MongoDB teams are pairing Atlas Vector Search with
+Voyage-3-large embeddings to serve financial research assistants. Engineers emphasize schema discipline so the
+Atlas Search index keeps pace with ingestion volume while still surfacing precise intents.
+
+Solution architects recommend hybrid BM25 + HNSW to mix lexical and neural relevance. By storing Voyage
+vectors in Atlas collections, they can re-rank matches over structured metadata, ensuring that domain-tuned
+passages stay visible during high-concurrency workloads.
+
+Implementation playbooks highlight command-pattern orchestration alongside chain-of-thought scaffolding to
+stabilise agent responses. Teams document how SOC 2 Type II requirements are met by using MongoDB Realm rules,
+scoped API keys, and encrypted S3 object storage for raw documents before chunking.
