@@ -9,20 +9,22 @@ then performs hybrid vector + keyword retrieval to answer free-form questions.
 from __future__ import annotations
 
 import logging
+import re
 import os
 import sys
 
 import boto3
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
+from agent.agentcore_config import MemoryAwareBedrockReasoner
 from services.atlas_store import AtlasStore, ChunkRecord
 from services.embedder import HashingEmbedder
 from services.s3_loader import S3DocumentLoader
 from services.text_processing import chunk_text, normalize_whitespace
-from services.prompting import build_grounded_answer_prompt
+from services.prompting import prepare_context_documents
 from services.llm_client import BedrockConfig, BedrockLLMClient, LLMInvocationError
 
 
@@ -38,6 +40,60 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+QUESTION_PREFIXES = (
+    "what",
+    "how",
+    "who",
+    "where",
+    "why",
+    "when",
+    "do",
+    "does",
+    "did",
+    "can",
+    "should",
+    "is",
+    "are",
+    "will",
+    "would",
+    "could",
+    "explain",
+    "tell",
+    "give",
+    "list",
+    "describe",
+)
+
+
+ACKNOWLEDGEMENT_MESSAGE = (
+    "Got it. I'll keep that in mind for any follow-up questions."
+)
+
+
+NO_CONTEXT_MESSAGE = (
+    "I don't have much information about that yet. Try adding documents or "
+    "sharing more details."
+)
+
+
+def _looks_like_question(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith("?"):
+        return True
+    lowered = stripped.lower()
+    return lowered.startswith(QUESTION_PREFIXES)
+
+
+_CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+
+
+def _has_citations(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_CITATION_PATTERN.search(text))
 
 
 @dataclass
@@ -61,6 +117,7 @@ class AppConfig:
     llm_max_tokens: int = 512
     llm_temperature: float = 0.2
     llm_streaming: bool = False
+    memory_short_term_turns: int = 12
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -97,6 +154,7 @@ class AppConfig:
             "yes",
             "on",
         }
+        memory_short_term_turns = int(_env_value("AGENT_MEMORY_TURNS") or "12")
 
         if missing:
             raise ValueError(
@@ -121,6 +179,7 @@ class AppConfig:
             llm_max_tokens=llm_max_tokens,
             llm_temperature=llm_temperature,
             llm_streaming=llm_streaming,
+            memory_short_term_turns=memory_short_term_turns,
         )
 
 
@@ -160,42 +219,6 @@ def ingest_documents(
     store.ensure_indexes(vector_dimensions=embedder.n_features)
 
     logger.info("Ingestion complete. Total chunks processed: %s", ingested_chunks)
-
-
-def generate_grounded_answer(
-    question: str,
-    documents: List[dict],
-    *,
-    llm_client: BedrockLLMClient,
-    max_tokens: int,
-    temperature: float,
-    stream: bool = False,
-    on_token: Optional[Callable[[str], None]] = None,
-) -> str:
-    """Invoke the LLM with the grounded prompt and return the response text."""
-    prompt = build_grounded_answer_prompt(question, documents)
-
-    if stream:
-        chunks: List[str] = []
-        try:
-            for piece in llm_client.stream(
-                prompt=prompt, max_tokens=max_tokens, temperature=temperature
-            ):
-                if on_token:
-                    on_token(piece)
-                chunks.append(piece)
-        except LLMInvocationError:
-            raise
-        return "".join(chunks).strip()
-
-    try:
-        response = llm_client.generate(
-            prompt=prompt, max_tokens=max_tokens, temperature=temperature
-        )
-    except LLMInvocationError:
-        raise
-    return response.strip()
-
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -242,6 +265,14 @@ def main() -> None:
         )
     )
 
+    reasoner = MemoryAwareBedrockReasoner(
+        llm_client,
+        max_tokens=config.llm_max_tokens,
+        temperature=config.llm_temperature,
+    )
+
+    short_term_memory: List[dict[str, str]] = []
+
     try:
         ingest_documents(loader=loader, embedder=embedder, store=store, config=config)
     except Exception as exc:  # noqa: BLE001 - surface ingestion problems to the console
@@ -251,74 +282,108 @@ def main() -> None:
     print("Documents are ready. Ask a question!")
     try:
         while True:
-            query = input("\nEnter your question (or type 'exit' to quit): ").strip()
+            query = input("\nShare a prompt or question (type 'exit' to leave): ").strip()
             if not query or query.lower() in {"exit", "quit"}:
                 break
 
+            is_question = _looks_like_question(query)
+
+            short_term_memory.append({"role": "user", "content": query})
+            max_messages = max(config.memory_short_term_turns * 2, 2)
+            if len(short_term_memory) > max_messages:
+                short_term_memory = short_term_memory[-max_messages:]
+
+            if not is_question:
+                acknowledgement = ACKNOWLEDGEMENT_MESSAGE
+                print("\nAssistant:\n" + acknowledgement)
+                short_term_memory.append({"role": "assistant", "content": acknowledgement})
+                if len(short_term_memory) > max_messages:
+                    short_term_memory = short_term_memory[-max_messages:]
+                continue
+
             query_vector = embedder.embed(query)
             try:
-                results = store.query(query_text=query, query_vector=query_vector, top_k=config.top_k)
+                results = store.query(
+                    query_text=query, query_vector=query_vector, top_k=config.top_k
+                )
             except Exception as exc:  # noqa: BLE001 - provide readable errors for query path
                 logger.error("Atlas Search query failed: %s", exc)
-                continue
+                results = []
 
-            if not results:
-                print("No documents matched your query.")
-                continue
+            if results:
+                print("\nAnswer:")
+                context_documents = prepare_context_documents(results)
+                memory_snapshot = {
+                    "short_term": short_term_memory[-config.memory_short_term_turns :],
+                    "long_term": context_documents,
+                }
+                try:
+                    if config.llm_streaming:
+                        printed = False
 
-            print("\nAnswer:")
-            try:
-                if config.llm_streaming:
-                    printed = False
+                        def _echo(text: str) -> None:
+                            nonlocal printed
+                            printed = True
+                            print(text, end="", flush=True)
 
-                    def _echo(text: str) -> None:
-                        nonlocal printed
-                        printed = True
-                        print(text, end="", flush=True)
+                        answer = reasoner.run(
+                            query,
+                            memory_snapshot=memory_snapshot,
+                            stream=True,
+                            on_token=_echo,
+                            max_tokens=config.llm_max_tokens,
+                            temperature=config.llm_temperature,
+                        )
+                        if printed:
+                            print()
+                        if not answer:
+                            print("(no response)")
+                    else:
+                        answer = reasoner.run(
+                            query,
+                            memory_snapshot=memory_snapshot,
+                            max_tokens=config.llm_max_tokens,
+                            temperature=config.llm_temperature,
+                        )
+                        print(answer or "(no response)")
+                except LLMInvocationError as exc:
+                    logger.error("LLM generation failed: %s", exc)
+                    short_term_memory.pop()
+                    continue
 
-                    answer = generate_grounded_answer(
-                        query,
-                        results,
-                        llm_client=llm_client,
-                        max_tokens=config.llm_max_tokens,
-                        temperature=config.llm_temperature,
-                        stream=True,
-                        on_token=_echo,
-                    )
-                    if printed:
-                        print()
-                    if not answer:
-                        print("(no response)")
-                else:
-                    answer = generate_grounded_answer(
-                        query,
-                        results,
-                        llm_client=llm_client,
-                        max_tokens=config.llm_max_tokens,
-                        temperature=config.llm_temperature,
-                    )
-                    print(answer or "(no response)")
-            except LLMInvocationError as exc:
-                logger.error("LLM generation failed: %s", exc)
-                continue
+                answer = answer or ""
+                short_term_memory.append({"role": "assistant", "content": answer})
+                if len(short_term_memory) > max_messages:
+                    short_term_memory = short_term_memory[-max_messages:]
 
-            print("\nCited context:")
-            for idx, doc in enumerate(results, start=1):
-                vector_score = doc.get("vector_score")
-                keyword_score = doc.get("keyword_score")
-                scores = [f"search={doc.get('search_score', 0):.3f}"]
-                if vector_score is not None:
-                    scores.append(f"vector={vector_score:.3f}")
-                if keyword_score is not None:
-                    scores.append(f"keyword={keyword_score:.3f}")
-                score_str = ", ".join(scores)
-                metadata = doc.get("metadata", {})
-                source = metadata.get("source") or metadata.get("s3_key") or doc.get("chunk_id")
-                snippet = normalize_whitespace(doc.get("text", ""))
-                if len(snippet) > 240:
-                    snippet = snippet[:237] + "..."
-                print(f"[{idx}] {source} ({score_str})")
-                print(f"    {snippet}")
+                if _has_citations(answer):
+                    print("\nCited context:")
+                    for idx, doc in enumerate(results, start=1):
+                        vector_score = doc.get("vector_score")
+                        keyword_score = doc.get("keyword_score")
+                        scores = [f"search={doc.get('search_score', 0):.3f}"]
+                        if vector_score is not None:
+                            scores.append(f"vector={vector_score:.3f}")
+                        if keyword_score is not None:
+                            scores.append(f"keyword={keyword_score:.3f}")
+                        score_str = ", ".join(scores)
+                        metadata = doc.get("metadata", {})
+                        source = (
+                            metadata.get("source")
+                            or metadata.get("s3_key")
+                            or doc.get("chunk_id")
+                        )
+                        snippet = normalize_whitespace(doc.get("text", ""))
+                        if len(snippet) > 240:
+                            snippet = snippet[:237] + "..."
+                        print(f"[{idx}] {source} ({score_str})")
+                        print(f"    {snippet}")
+            else:
+                fallback = NO_CONTEXT_MESSAGE
+                print("\nAnswer:\n" + fallback)
+                short_term_memory.append({"role": "assistant", "content": fallback})
+                if len(short_term_memory) > max_messages:
+                    short_term_memory = short_term_memory[-max_messages:]
     except KeyboardInterrupt:
         pass
 

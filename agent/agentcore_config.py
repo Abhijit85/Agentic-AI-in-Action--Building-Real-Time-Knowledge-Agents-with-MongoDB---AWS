@@ -10,20 +10,35 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-import boto3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from services.atlas_store import AtlasStore, ChunkRecord
-from services.embedder import HashingEmbedder
-from services.llm_client import BedrockConfig, BedrockLLMClient
-from services.s3_loader import S3DocumentLoader
+try:  # Defer boto3 dependency so unit tests can run without AWS bindings.
+    import boto3
+except Exception as boto3_exc:  # pragma: no cover - exercised in non-AWS test envs
+    boto3 = None  # type: ignore[assignment]
+    _BOTO3_IMPORT_ERROR = boto3_exc
+else:
+    _BOTO3_IMPORT_ERROR = None
+
 from services.text_processing import chunk_text, normalize_whitespace
 from services.prompting import build_grounded_answer_prompt, prepare_context_documents
 
+if TYPE_CHECKING:  # pragma: no cover - import guards for optional dependencies
+    from services.atlas_store import AtlasStore, ChunkRecord
+    from services.embedder import HashingEmbedder
+    from services.llm_client import BedrockLLMClient, BedrockConfig
+    from services.s3_loader import S3DocumentLoader
+
 logger = logging.getLogger(__name__)
+
+
+def _default_embedder() -> "HashingEmbedder":
+    from services.embedder import HashingEmbedder
+
+    return HashingEmbedder()
 
 # ----------------------------------------------------------------------------
 # Settings
@@ -162,10 +177,12 @@ class AgentResources:
     """Lazily constructed handles to external systems."""
 
     settings: AgentCoreSettings
-    embedder: HashingEmbedder = field(default_factory=HashingEmbedder)
+    embedder: "HashingEmbedder" = field(default_factory=_default_embedder)
 
     @cached_property
-    def atlas_store(self) -> AtlasStore:
+    def atlas_store(self) -> "AtlasStore":
+        from services.atlas_store import AtlasStore
+
         return AtlasStore(
             connection_string=self.settings.mongodb_uri,
             database=self.settings.mongodb_db,
@@ -174,7 +191,12 @@ class AgentResources:
         )
 
     @cached_property
-    def aws_session(self) -> boto3.session.Session:
+    def aws_session(self) -> Any:
+        if boto3 is None:
+            raise RuntimeError(
+                "boto3 could not be imported. Install AWS dependencies or "
+                "configure tests to stub AWS access."
+            ) from _BOTO3_IMPORT_ERROR
         session_kwargs = {
             "aws_access_key_id": self.settings.aws_access_key_id,
             "aws_secret_access_key": self.settings.aws_secret_access_key,
@@ -185,7 +207,9 @@ class AgentResources:
         return boto3.session.Session(**session_kwargs)
 
     @cached_property
-    def s3_loader(self) -> S3DocumentLoader:
+    def s3_loader(self) -> "S3DocumentLoader":
+        from services.s3_loader import S3DocumentLoader
+
         return S3DocumentLoader(
             bucket_name=self.settings.s3_bucket,
             prefix=self.settings.s3_prefix,
@@ -193,7 +217,9 @@ class AgentResources:
         )
 
     @cached_property
-    def bedrock_client(self) -> BedrockLLMClient:
+    def bedrock_client(self) -> "BedrockLLMClient":
+        from services.llm_client import BedrockConfig, BedrockLLMClient
+
         return BedrockLLMClient(
             BedrockConfig(
                 region=self.settings.aws_region,
@@ -316,9 +342,13 @@ class MemoryAwareBedrockReasoner:
             )
 
         instructions = (
-            "You are an enterprise retrieval assistant. Use the supplied memory "
-            "and tool outputs to answer. Cite sources with [n] and state when "
-            "information is missing."
+            "You are an enterprise retrieval assistant. Use the supplied recent "
+            "conversation and tool outputs to answer the user. When the answer "
+            "comes from retrieved documents, cite sources with [n]. When it "
+            "comes solely from the conversation context, reference that it was "
+            "mentioned earlier instead of citing a source. Only state that "
+            "information is missing if neither memory nor retrieved documents "
+            "provide the answer."
         )
         context_block = "\n\n".join(sections)
         return (
@@ -497,6 +527,8 @@ mongo_atlas_query_tool = mongo_search_tool
 
 def s3_ingest_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """Ingest documents from S3 via the AgentCore gateway."""
+    from services.atlas_store import ChunkRecord
+
     resources = _require_resources()
     resources.ensure_vector_index()
 
@@ -515,7 +547,7 @@ def s3_ingest_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
 
     processed_documents = 0
     total_chunks = 0
-    upsert_batch: List[ChunkRecord] = []
+    upsert_batch: List["ChunkRecord"] = []
     processed_keys: List[str] = []
 
     for document in resources.s3_loader.iter_documents():
