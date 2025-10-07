@@ -28,17 +28,60 @@ from services.prompting import build_grounded_answer_prompt, prepare_context_doc
 
 if TYPE_CHECKING:  # pragma: no cover - import guards for optional dependencies
     from services.atlas_store import AtlasStore, ChunkRecord
-    from services.embedder import HashingEmbedder
+    from services.embedder import EmbeddingBackend
     from services.llm_client import BedrockLLMClient, BedrockConfig
     from services.s3_loader import S3DocumentLoader
 
 logger = logging.getLogger(__name__)
 
 
-def _default_embedder() -> "HashingEmbedder":
-    from services.embedder import HashingEmbedder
+def _unset_if_blank(name: str) -> None:
+    value = os.environ.get(name)
+    if value is not None and value.strip() == "":
+        os.environ.pop(name, None)
 
-    return HashingEmbedder()
+
+_unset_if_blank("AWS_PROFILE")
+
+
+def _coalesce_env(name: str) -> Optional[str]:
+    """Return the environment value, treating blanks as missing."""
+    value = os.getenv(name)
+    if value is None:
+        return None
+    if value.strip() == "":
+        return None
+    return value
+
+
+def _int_from_env(name: str, default: int) -> int:
+    value = _coalesce_env(name)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _float_from_env(name: str, default: float) -> float:
+    value = _coalesce_env(name)
+    if value is None:
+        return default
+    return float(value)
+
+
+def _build_embedder(settings: "AgentCoreSettings") -> "EmbeddingBackend":
+    """Return an embedder aligned with Atlas vector search configuration."""
+    from services.embedder import HashingEmbedder, build_embedder_from_env
+
+    try:
+        embedder = build_embedder_from_env(settings.embedding_dimensions)
+    except Exception as exc:  # noqa: BLE001 - log and fall back to deterministic hashing
+        logger.warning(
+            "Falling back to hashing embedder (dimensions=%s) due to: %s",
+            settings.embedding_dimensions,
+            exc,
+        )
+        embedder = HashingEmbedder(n_features=settings.embedding_dimensions)
+    return embedder
 
 # ----------------------------------------------------------------------------
 # Settings
@@ -78,6 +121,7 @@ class AgentCoreSettings:
     memory_short_term_max_turns: int = 12
     memory_short_term_token_limit: int = 4800
     memory_long_term_top_k: int = 5
+    embedding_dimensions: int = 1024
 
     ingestion_chunk_words: int = 400
     ingestion_chunk_overlap: int = 40
@@ -108,11 +152,11 @@ class AgentCoreSettings:
     def from_env(cls) -> "AgentCoreSettings":
         """Build settings from environment variables shared with the demo."""
         required = {
-            "S3_BUCKET_NAME": os.getenv("S3_BUCKET_NAME"),
-            "MONGODB_ATLAS_URI": os.getenv("MONGODB_ATLAS_URI"),
-            "AWS_REGION": os.getenv("AWS_REGION"),
-            "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID"),
-            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY"),
+            "S3_BUCKET_NAME": _coalesce_env("S3_BUCKET_NAME"),
+            "MONGODB_ATLAS_URI": _coalesce_env("MONGODB_ATLAS_URI"),
+            "AWS_REGION": _coalesce_env("AWS_REGION"),
+            "AWS_ACCESS_KEY_ID": _coalesce_env("AWS_ACCESS_KEY_ID"),
+            "AWS_SECRET_ACCESS_KEY": _coalesce_env("AWS_SECRET_ACCESS_KEY"),
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
@@ -121,44 +165,46 @@ class AgentCoreSettings:
                 + ", ".join(missing)
             )
 
-        aws_session_token = os.getenv("AWS_SESSION_TOKEN")
+        aws_session_token = _coalesce_env("AWS_SESSION_TOKEN")
 
         return cls(
             aws_region=required["AWS_REGION"],
             mongodb_uri=required["MONGODB_ATLAS_URI"],
-            mongodb_db=os.getenv("ATLAS_DB_NAME", "demo"),
-            mongodb_collection=os.getenv("ATLAS_COLLECTION_NAME", "documents"),
-            atlas_search_index=os.getenv("ATLAS_SEARCH_INDEX_NAME", "demo_rag_index"),
+            mongodb_db=_coalesce_env("ATLAS_DB_NAME") or "media_rag",
+            mongodb_collection=_coalesce_env("ATLAS_COLLECTION_NAME") or "video_chunks",
+            atlas_search_index=_coalesce_env("ATLAS_SEARCH_INDEX_NAME") or "video_chunks_rag_index",
             s3_bucket=required["S3_BUCKET_NAME"],
-            s3_prefix=os.getenv("S3_PREFIX"),
+            s3_prefix=_coalesce_env("S3_PREFIX"),
             aws_access_key_id=required["AWS_ACCESS_KEY_ID"],
             aws_secret_access_key=required["AWS_SECRET_ACCESS_KEY"],
             aws_session_token=aws_session_token,
-            bedrock_model_id=os.getenv(
-                "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
+            bedrock_model_id=_coalesce_env(
+                "BEDROCK_MODEL_ID"
+            )
+            or "anthropic.claude-3-haiku-20240307-v1:0",
+            bedrock_max_tokens=_int_from_env("LLM_MAX_TOKENS", 1024),
+            bedrock_temperature=_float_from_env("LLM_TEMPERATURE", 0.2),
+            deployment_channel=_coalesce_env("AGENT_CHANNEL") or "cli",
+            cloudwatch_log_group=_coalesce_env(
+                "AGENT_CLOUDWATCH_LOG_GROUP"
+            )
+            or "/agentcore/demo",
+            cloudwatch_trace_namespace=_coalesce_env(
+                "AGENT_CLOUDWATCH_TRACE_NS"
+            )
+            or "AgentCore/Demo",
+            memory_short_term_max_turns=_int_from_env("AGENT_MEMORY_TURNS", 12),
+            memory_short_term_token_limit=_int_from_env(
+                "AGENT_MEMORY_TOKENS", 4800
             ),
-            bedrock_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "1024")),
-            bedrock_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
-            deployment_channel=os.getenv("AGENT_CHANNEL", "cli"),
-            cloudwatch_log_group=os.getenv(
-                "AGENT_CLOUDWATCH_LOG_GROUP", "/agentcore/demo"
-            ),
-            cloudwatch_trace_namespace=os.getenv(
-                "AGENT_CLOUDWATCH_TRACE_NS", "AgentCore/Demo"
-            ),
-            memory_short_term_max_turns=int(os.getenv("AGENT_MEMORY_TURNS", "12")),
-            memory_short_term_token_limit=int(
-                os.getenv("AGENT_MEMORY_TOKENS", "4800")
-            ),
-            memory_long_term_top_k=int(os.getenv("AGENT_MEMORY_TOPK", "5")),
-            ingestion_chunk_words=int(os.getenv("CHUNK_WORDS", "400")),
-            ingestion_chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "40")),
-            cognito_user_pool_id=os.getenv("AGENT_COGNITO_USER_POOL_ID"),
-            cognito_app_client_id=os.getenv("AGENT_COGNITO_APP_CLIENT_ID"),
-            identity_provider=os.getenv(
-                "AGENT_IDENTITY_PROVIDER",
-                "agentcore.identity.CognitoIdentityProvider",
-            ),
+            memory_long_term_top_k=_int_from_env("AGENT_MEMORY_TOPK", 5),
+            embedding_dimensions=_int_from_env("ATLAS_EMBEDDING_DIM", 1024),
+            ingestion_chunk_words=_int_from_env("CHUNK_WORDS", 400),
+            ingestion_chunk_overlap=_int_from_env("CHUNK_OVERLAP", 40),
+            cognito_user_pool_id=_coalesce_env("AGENT_COGNITO_USER_POOL_ID"),
+            cognito_app_client_id=_coalesce_env("AGENT_COGNITO_APP_CLIENT_ID"),
+            identity_provider=_coalesce_env("AGENT_IDENTITY_PROVIDER")
+            or "agentcore.identity.CognitoIdentityProvider",
             identity_allowed_groups=[
                 group.strip()
                 for group in os.getenv("AGENT_ALLOWED_GROUPS", "").split(",")
@@ -177,7 +223,17 @@ class AgentResources:
     """Lazily constructed handles to external systems."""
 
     settings: AgentCoreSettings
-    embedder: "HashingEmbedder" = field(default_factory=_default_embedder)
+    embedder: Optional["EmbeddingBackend"] = None
+
+    def __post_init__(self) -> None:
+        if self.embedder is None:
+            self.embedder = _build_embedder(self.settings)
+        if getattr(self.embedder, "n_features", None) != self.settings.embedding_dimensions:
+            logger.warning(
+                "Embedder dimension (%s) does not match configured Atlas index dimension (%s).",
+                getattr(self.embedder, "n_features", None),
+                self.settings.embedding_dimensions,
+            )
 
     @cached_property
     def atlas_store(self) -> "AtlasStore":
@@ -235,7 +291,7 @@ class AgentResources:
     def ensure_vector_index(self) -> None:
         try:
             self.atlas_store.ensure_indexes(
-                vector_dimensions=self.embedder.n_features
+                vector_dimensions=self.settings.embedding_dimensions
             )
         except Exception as exc:  # noqa: BLE001 - surface integration issues upstream
             logger.warning("Unable to ensure Atlas Search index: %s", exc)
@@ -388,6 +444,82 @@ def _format_long_term(documents: Iterable[Mapping[str, Any]]) -> str:
 # ----------------------------------------------------------------------------
 
 
+def _parse_media_filters(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalise optional media filters supplied to the Atlas search tool."""
+
+    def _clean(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return None
+            return trimmed
+        if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)):
+            cleaned_list = [item for item in value if item not in ("", None)]
+            return cleaned_list or None
+        return value
+
+    filters: Dict[str, Any] = {}
+    raw_filters = payload.get("filters")
+    if isinstance(raw_filters, Mapping):
+        for key, value in raw_filters.items():
+            cleaned = _clean(value)
+            if cleaned is not None:
+                filters[key] = cleaned
+
+    alias_map = {
+        "video_id": "video_id",
+        "video": "video_title",
+        "video_title": "video_title",
+        "channel": "channel",
+        "channel_title": "channel",
+        "channel_id": "channel_id",
+        "speaker": "speaker",
+        "speaker_role": "speaker_role",
+        "playlist_id": "playlist_id",
+        "segment_id": "segment_id",
+    }
+    for alias, canonical in alias_map.items():
+        if canonical in filters:
+            continue
+        value = payload.get(alias)
+        cleaned = _clean(value)
+        if cleaned is not None:
+            filters[canonical] = cleaned
+
+    def _float_from_payload(keys: Iterable[str]) -> Optional[float]:
+        for key in keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    time_range: Dict[str, float] = {}
+    start_value = _float_from_payload(["start_time", "after", "from", "time_start"])
+    end_value = _float_from_payload(["end_time", "before", "to", "time_end"])
+    if isinstance(filters.get("time_range"), Mapping):
+        existing = filters["time_range"]
+        start_value = start_value or _float_from_payload(
+            [key for key in ("start", "from", "after") if key in existing]
+        )
+        end_value = end_value or _float_from_payload(
+            [key for key in ("end", "to", "before") if key in existing]
+        )
+    if start_value is not None:
+        time_range["start"] = start_value
+    if end_value is not None:
+        time_range["end"] = end_value
+    if time_range:
+        filters["time_range"] = time_range
+
+    return filters
+
+
 def mongo_search_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """Run a hybrid Atlas Search query using the conversation embedder."""
     resources = _require_resources()
@@ -404,11 +536,18 @@ def mongo_search_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
     top_k = int(payload.get("top_k") or resources.settings.memory_long_term_top_k)
     logger.debug("Running Atlas tool query (top_k=%s)", top_k)
 
+    if resources.embedder is None:
+        raise RuntimeError("Embedder is not initialised.")
     vector = resources.embedder.embed(question)
+    filters = _parse_media_filters(payload)
+    if filters:
+        logger.debug("Applying media filters to Atlas search: %s", filters)
+
     documents = resources.atlas_store.query(
         query_text=question,
         query_vector=vector,
         top_k=top_k,
+        filters=filters or None,
     )
 
     for doc in documents:
@@ -493,8 +632,35 @@ def bedrock_answer_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 or metadata.get("uri")
                 or metadata.get("document_id")
             )
+            video_id = metadata.get("video_id")
+            video_title = metadata.get("video_title")
+            channel = metadata.get("channel") or metadata.get("channel_title")
+            speaker = metadata.get("speaker") or metadata.get("speaker_role")
+            start_time = metadata.get("start_time")
+            end_time = metadata.get("end_time")
+            playlist_id = metadata.get("playlist_id")
+            segment_id = metadata.get("segment_id")
+            thumbnail_url = metadata.get("thumbnail_url")
+            video_url = metadata.get("video_url")
+            if not video_url and video_id:
+                try:
+                    start_seconds = int(max(float(start_time), 0)) if start_time is not None else None
+                except (TypeError, ValueError):
+                    start_seconds = None
+                timestamp_suffix = f"&t={start_seconds}s" if start_seconds is not None else ""
+                video_url = f"https://www.youtube.com/watch?v={video_id}{timestamp_suffix}"
         else:
             source = None
+            video_id = None
+            video_title = None
+            channel = None
+            speaker = None
+            start_time = None
+            end_time = None
+            playlist_id = None
+            segment_id = None
+            thumbnail_url = None
+            video_url = None
         sources.append(
             {
                 "source": source,
@@ -502,6 +668,16 @@ def bedrock_answer_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 "vector_score": doc.get("vector_score"),
                 "keyword_score": doc.get("keyword_score"),
                 "search_score": doc.get("search_score"),
+                "video_id": video_id,
+                "video_title": video_title,
+                "channel": channel,
+                "speaker": speaker,
+                "start_time": start_time,
+                "end_time": end_time,
+                "playlist_id": playlist_id,
+                "segment_id": segment_id,
+                "video_url": video_url,
+                "thumbnail_url": thumbnail_url,
             }
         )
 
@@ -549,6 +725,9 @@ def s3_ingest_tool(payload: Mapping[str, Any]) -> Dict[str, Any]:
     total_chunks = 0
     upsert_batch: List["ChunkRecord"] = []
     processed_keys: List[str] = []
+
+    if resources.embedder is None:
+        raise RuntimeError("Embedder is not initialised.")
 
     for document in resources.s3_loader.iter_documents():
         processed_documents += 1
@@ -613,6 +792,16 @@ def build_tool_specs(resources: AgentResources) -> List[Dict[str, Any]]:
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "filters": {"type": "object"},
+                    "channel": {"type": "string"},
+                    "channel_id": {"type": "string"},
+                    "speaker": {"type": "string"},
+                    "video_id": {"type": "string"},
+                    "video_title": {"type": "string"},
+                    "playlist_id": {"type": "string"},
+                    "segment_id": {"type": "string"},
+                    "start_time": {"type": "number", "minimum": 0},
+                    "end_time": {"type": "number", "minimum": 0},
                 },
                 "required": ["query"],
             },
@@ -831,7 +1020,9 @@ def build_agentcore_configuration(
                     "database": settings.mongodb_db,
                     "collection": settings.mongodb_collection,
                     "index_name": settings.atlas_search_index,
-                    "embedding_dimensions": resources.embedder.n_features,
+                    "embedding_dimensions": getattr(
+                        resources.embedder, "n_features", settings.embedding_dimensions
+                    ),
                     "top_k": settings.memory_long_term_top_k,
                 },
             },
@@ -920,6 +1111,8 @@ def initialise_agent_runtime(settings: AgentCoreSettings) -> Any:
 
 def build_reasoner(settings: AgentCoreSettings) -> MemoryAwareBedrockReasoner:
     """Create a Bedrock-backed reasoner using project services."""
+    from services.llm_client import BedrockConfig, BedrockLLMClient
+
     client = BedrockLLMClient(
         BedrockConfig(
             region=settings.aws_region,

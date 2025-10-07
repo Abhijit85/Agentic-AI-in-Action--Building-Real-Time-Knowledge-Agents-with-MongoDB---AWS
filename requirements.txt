@@ -4,3 +4,4 @@ pymongo
 scikit-learn
 python-dotenv
 pytest
+streamlit

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from pymongo import MongoClient, UpdateOne
 from pymongo.collection import Collection
@@ -58,18 +58,22 @@ class AtlasStore:
                                 "numDimensions": vector_dimensions,
                                 "similarity": "cosine",
                             },
-                            {
-                                "type": "filter",
-                                "path": "metadata.source",
-                            },
-                            {
-                                "type": "filter",
-                                "path": "metadata.s3_key",
-                            },
-                            {
-                                "type": "filter",
-                                "path": "metadata.chunk_index",
-                            },
+                            {"type": "filter", "path": "metadata.source"},
+                            {"type": "filter", "path": "metadata.s3_key"},
+                            {"type": "filter", "path": "metadata.chunk_index"},
+                            {"type": "filter", "path": "metadata.video_id"},
+                            {"type": "filter", "path": "metadata.video_title"},
+                            {"type": "filter", "path": "metadata.video_url"},
+                            {"type": "filter", "path": "metadata.channel"},
+                            {"type": "filter", "path": "metadata.channel_title"},
+                            {"type": "filter", "path": "metadata.channel_id"},
+                            {"type": "filter", "path": "metadata.speaker"},
+                            {"type": "filter", "path": "metadata.speaker_role"},
+                            {"type": "filter", "path": "metadata.playlist_id"},
+                            {"type": "filter", "path": "metadata.segment_id"},
+                            {"type": "filter", "path": "metadata.start_time"},
+                            {"type": "filter", "path": "metadata.end_time"},
+                            {"type": "filter", "path": "metadata.tags"},
                         ]
                     },
                 }
@@ -115,6 +119,7 @@ class AtlasStore:
         query_text: str,
         query_vector: List[float],
         top_k: int = 3,
+        filters: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, object]]:
         """Run a hybrid Atlas Search query returning score components."""
         if not query_vector:
@@ -130,7 +135,93 @@ class AtlasStore:
                     "numCandidates": num_candidates,
                     "limit": max(top_k, 1),
                 }
-            },
+            }
+        ]
+
+        match_clauses: List[Dict[str, Any]] = []
+        if filters:
+            field_map = {
+                "video_id": "metadata.video_id",
+                "video_title": "metadata.video_title",
+                "channel": "metadata.channel",
+                "channel_title": "metadata.channel_title",
+                "channel_id": "metadata.channel_id",
+                "speaker": "metadata.speaker",
+                "speaker_role": "metadata.speaker_role",
+                "playlist_id": "metadata.playlist_id",
+                "segment_id": "metadata.segment_id",
+                "tags": "metadata.tags",
+            }
+
+            def _coerce_float(value: Any) -> Optional[float]:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
+            time_range = filters.get("time_range")
+            start_bound = (
+                _coerce_float(filters.get("start_time"))
+                or _coerce_float(filters.get("after"))
+                or _coerce_float(filters.get("from"))
+            )
+            end_bound = (
+                _coerce_float(filters.get("end_time"))
+                or _coerce_float(filters.get("before"))
+                or _coerce_float(filters.get("to"))
+            )
+            if isinstance(time_range, Mapping):
+                start_bound = start_bound or _coerce_float(
+                    time_range.get("start")
+                    or time_range.get("from")
+                    or time_range.get("after")
+                )
+                end_bound = end_bound or _coerce_float(
+                    time_range.get("end")
+                    or time_range.get("to")
+                    or time_range.get("before")
+                )
+
+            if start_bound is not None:
+                match_clauses.append({"metadata.end_time": {"$gte": start_bound}})
+            if end_bound is not None:
+                match_clauses.append({"metadata.start_time": {"$lte": end_bound}})
+
+            for key, value in filters.items():
+                if key in {
+                    "time_range",
+                    "start_time",
+                    "end_time",
+                    "after",
+                    "before",
+                    "from",
+                    "to",
+                }:
+                    continue
+                path = field_map.get(key)
+                if not path:
+                    # Preserve backwards compatibility for existing metadata.* keys.
+                    if key.startswith("metadata."):
+                        path = key
+                    else:
+                        continue
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple, set)):
+                    values = [item for item in value if item not in ("", None)]
+                    if not values:
+                        continue
+                    match_clauses.append({path: {"$in": values}})
+                else:
+                    match_clauses.append({path: value})
+
+        if match_clauses:
+            if len(match_clauses) == 1:
+                pipeline.append({"$match": match_clauses[0]})
+            else:
+                pipeline.append({"$match": {"$and": match_clauses}})
+
+        pipeline.append(
             {
                 "$project": {
                     "_id": 0,
@@ -139,8 +230,8 @@ class AtlasStore:
                     "metadata": 1,
                     "vector_score": {"$meta": "vectorSearchScore"},
                 }
-            },
-        ]
+            }
+        )
 
         results = list(self._collection.aggregate(pipeline))
         for doc in results:

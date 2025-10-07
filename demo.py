@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from agent.agentcore_config import MemoryAwareBedrockReasoner
 from services.atlas_store import AtlasStore, ChunkRecord
-from services.embedder import HashingEmbedder
+from services.embedder import EmbeddingBackend, HashingEmbedder, build_embedder_from_env
 from services.s3_loader import S3DocumentLoader
 from services.text_processing import chunk_text, normalize_whitespace
 from services.prompting import prepare_context_documents
@@ -118,6 +118,7 @@ class AppConfig:
     llm_temperature: float = 0.2
     llm_streaming: bool = False
     memory_short_term_turns: int = 12
+    embedding_dimensions: int = 1024
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -129,9 +130,9 @@ class AppConfig:
         if not mongodb_uri:
             missing.append("MONGODB_ATLAS_URI")
 
-        mongodb_db = _env_value("ATLAS_DB_NAME") or "demo"
-        mongodb_collection = _env_value("ATLAS_COLLECTION_NAME") or "documents"
-        search_index = _env_value("ATLAS_SEARCH_INDEX_NAME") or "demo_rag_index"
+        mongodb_db = _env_value("ATLAS_DB_NAME") or "media_rag"
+        mongodb_collection = _env_value("ATLAS_COLLECTION_NAME") or "video_chunks"
+        search_index = _env_value("ATLAS_SEARCH_INDEX_NAME") or "video_chunks_rag_index"
         aws_region = _env_value("AWS_REGION")
         if not aws_region:
             missing.append("AWS_REGION")
@@ -155,6 +156,7 @@ class AppConfig:
             "on",
         }
         memory_short_term_turns = int(_env_value("AGENT_MEMORY_TURNS") or "12")
+        embedding_dimensions = int(_env_value("ATLAS_EMBEDDING_DIM") or "1024")
 
         if missing:
             raise ValueError(
@@ -180,13 +182,14 @@ class AppConfig:
             llm_temperature=llm_temperature,
             llm_streaming=llm_streaming,
             memory_short_term_turns=memory_short_term_turns,
+            embedding_dimensions=embedding_dimensions,
         )
 
 
 def ingest_documents(
     *,
     loader: S3DocumentLoader,
-    embedder: HashingEmbedder,
+    embedder: EmbeddingBackend,
     store: AtlasStore,
     config: AppConfig,
 ) -> None:
@@ -216,7 +219,7 @@ def ingest_documents(
         store.upsert_chunks(batch)
 
     # Ensure the Atlas Search index exists once documents are present.
-    store.ensure_indexes(vector_dimensions=embedder.n_features)
+    store.ensure_indexes(vector_dimensions=config.embedding_dimensions)
 
     logger.info("Ingestion complete. Total chunks processed: %s", ingested_chunks)
 
@@ -246,7 +249,11 @@ def main() -> None:
         prefix=config.s3_prefix,
         s3_client=aws_session.client("s3"),
     )
-    embedder = HashingEmbedder()
+    try:
+        embedder = build_embedder_from_env(config.embedding_dimensions)
+    except Exception as exc:  # noqa: BLE001 - fall back to deterministic hashing locally
+        logger.warning("Falling back to hashing embedder: %s", exc)
+        embedder = HashingEmbedder(n_features=config.embedding_dimensions)
     store = AtlasStore(
         connection_string=config.mongodb_uri,
         database=config.mongodb_db,

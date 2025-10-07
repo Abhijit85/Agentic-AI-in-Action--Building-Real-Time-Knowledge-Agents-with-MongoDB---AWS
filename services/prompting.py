@@ -2,15 +2,39 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, MutableMapping, Sequence
-from typing import List
+from typing import List, Optional
 
 from .text_processing import normalize_whitespace
 
 DEFAULT_GROUNDED_INSTRUCTIONS = (
-    "You are an expert assistant answering questions using only the supplied context. "
-    "If the answer cannot be derived from the context, reply that you do not know. "
-    "Cite sources inline using the bracketed numbers, e.g., [1]."
+    "You are a media research assistant. Answer using only the supplied YouTube transcript "
+    "segments. Highlight the video title or segment scope when relevant, and cite evidence "
+    "with bracketed numbers (e.g., [1]). If the context does not answer the question, state "
+    "that the information was not mentioned."
 )
+
+
+def _format_timestamp_label(value: object) -> Optional[str]:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        seconds = 0.0
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _format_time_range(start: object, end: object) -> Optional[str]:
+    start_label = _format_timestamp_label(start)
+    end_label = _format_timestamp_label(end)
+    if start_label and end_label:
+        return f"{start_label}–{end_label}"
+    return start_label or end_label
 
 
 def prepare_context_documents(
@@ -78,19 +102,68 @@ def build_grounded_answer_prompt(
     for idx, doc in enumerate(documents, start=1):
         metadata = doc.get("metadata", {}) if isinstance(doc, Mapping) else {}
         if isinstance(metadata, Mapping):
-            source = (
-                metadata.get("source")
-                or metadata.get("s3_key")
-                or metadata.get("uri")
-                or metadata.get("document_id")
-                or doc.get("chunk_id")
+            source = metadata.get("source") or metadata.get("s3_key")
+            video_title = (
+                metadata.get("video_title")
+                or metadata.get("video", {}).get("title")  # type: ignore[call-arg]
+                if isinstance(metadata.get("video"), Mapping)
+                else None
             )
+            channel = (
+                metadata.get("channel")
+                or metadata.get("channel_title")
+                or metadata.get("video", {}).get("channel")  # type: ignore[call-arg]
+                if isinstance(metadata.get("video"), Mapping)
+                else None
+            )
+            speaker = metadata.get("speaker") or metadata.get("speaker_role")
+            time_range = _format_time_range(
+                metadata.get("start_time"),
+                metadata.get("end_time"),
+            )
+            video_id = metadata.get("video_id")
+            video_url = metadata.get("video_url")
+            if not video_url and video_id:
+                start_seconds = metadata.get("start_time")
+                timestamp_suffix = ""
+                try:
+                    if start_seconds is not None:
+                        timestamp_suffix = f"&t={int(max(float(start_seconds), 0))}s"
+                except (TypeError, ValueError):
+                    timestamp_suffix = ""
+                video_url = f"https://www.youtube.com/watch?v={video_id}{timestamp_suffix}"
         else:
             source = None
+            video_title = None
+            channel = None
+            speaker = None
+            time_range = None
+            video_url = None
+
         snippet = normalize_whitespace(str(doc.get("text", "")))
         if not snippet:
             continue
-        context_sections.append(f"[{idx}] Source: {source or 'unknown'}\n{snippet}")
+        display_title = video_title or source or metadata.get("document_id") if isinstance(metadata, Mapping) else None
+        if not display_title:
+            display_title = doc.get("chunk_id") if isinstance(doc, Mapping) else "segment"
+        header = f"[{idx}] {display_title}"
+
+        detail_pieces = []
+        if channel:
+            detail_pieces.append(f"Channel: {channel}")
+        if speaker:
+            detail_pieces.append(f"Speaker: {speaker}")
+        if time_range:
+            detail_pieces.append(f"Time: {time_range}")
+        if video_url:
+            detail_pieces.append(f"Link: {video_url}")
+        elif source:
+            detail_pieces.append(f"Source: {source}")
+
+        if detail_pieces:
+            header += "\n" + " | ".join(detail_pieces)
+
+        context_sections.append(f"{header}\n{snippet}")
 
     context_block = "\n\n".join(context_sections)
     prompt_instructions = instructions.strip() if instructions else DEFAULT_GROUNDED_INSTRUCTIONS
